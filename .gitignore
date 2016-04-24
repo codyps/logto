@@ -1,0 +1,5 @@
+.build-*
+.ninja_*
+build.ninja
+
+logto
