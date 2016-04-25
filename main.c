@@ -63,7 +63,7 @@ static void fbuf_init(struct fbuf *f)
 
 
 static
-const char *opts = ":hkns";
+const char *opts = ":hknsp:P";
 #define PRGMNAME_DEFAULT "logto"
 
 static
@@ -79,10 +79,12 @@ void usage_(const char *prgmname, int e)
 "Usage: %s [options] -- <program> [<args>...]\n"
 "\n"
 "Options: [%s]\n"
-" -k    send output to /dev/kmsg\n"
-" -n    send output to netconsole (udp)\n"
-" -s    send output to syslog (local)\n"
-" -h    show this help text\n",
+" -k          send output to /dev/kmsg\n"
+" -n          send output to netconsole (udp)\n"
+" -s          send output to syslog (local)\n"
+" -p <name>   include name in the redirected output\n"
+" -P          as if `-p` was used with the last element of <program>\n"
+" -h          show this help text\n",
 	prgmname, opts);
 	exit(e);
 }
@@ -92,8 +94,10 @@ int main(int argc, char **argv)
 {
 	const char *prgmname = argc?argv[0]:PRGMNAME_DEFAULT;
 	int opt, err = 0;
+	const char *name = NULL;
 
 	bool use_kmsg = false, use_netconsole = false, use_syslog = false;
+	bool auto_name = false;
 
 	while ((opt = getopt(argc, argv, opts)) != -1) {
 		switch (opt) {
@@ -108,6 +112,13 @@ int main(int argc, char **argv)
 			break;
 		case 's':
 			use_syslog = true;
+			break;
+		case 'p':
+			free(name);
+			name = strdup(optarg);
+			break;
+		case 'P':
+			auto_name = true;
 			break;
 		case '?':
 			err++;
@@ -129,6 +140,11 @@ int main(int argc, char **argv)
 		err++;
 	}
 
+	if (name && auto_name) {
+		fprintf(stderr, "Use either -p or -P, not both\n");
+		err++;
+	}
+
 	if (err)
 		usage(EXIT_FAILURE);
 
@@ -142,6 +158,14 @@ int main(int argc, char **argv)
 	argc -= optind;
 	argv += optind;
 
+	if (auto_name) {
+		/* direct assignment (instead of strdup) is fine because we're
+		 * never going to free(name) */
+		name = strrchr(argv[0], '/');
+		if (!name)
+			name = argv[0];
+	}
+
 	/* NOTE: error checking throughout this is a very fiddly problem:
 	 * because of the type of program this is, unless we're able to log
 	 * messages over the medium we're trying to open, the output may never
@@ -150,19 +174,20 @@ int main(int argc, char **argv)
 
 	/* 0 = read, 1 = write */
 	int new_stdout[] = {-1, -1};
-	if (use_kmsg) {
+	if (use_kmsg && !name) {
 		new_stdout[1] = open("/dev/kmsg", O_RDWR);
 		if (new_stdout[1] == -1) {
 			fprintf(stderr, "could not open /dev/kmsg: %s\n", strerror(errno));
 			exit(EXIT_FAILURE);
 		}
-	} else if (use_netconsole || use_syslog) {
+	} else {
 		int r = pipe(new_stdout);
 		if (r == -1) {
 			fprintf(stderr, "could not setup pipe(): %s\n", strerror(errno));
 			exit(EXIT_FAILURE);
 		}
 	}
+
 
 	/* if required, fork */
 	bool should_exec = true;
