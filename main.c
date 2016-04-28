@@ -17,6 +17,13 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
+/* writev (netconsole + kmsg) */
+#include <sys/uio.h>
+
+/* socket (netconsole) */
+#include <sys/types.h>
+#include <sys/socket.h>
+
 struct fbuf {
 	size_t bytes_in_buf;
 	uint8_t buf[4096];
@@ -61,6 +68,8 @@ static void fbuf_init(struct fbuf *f)
 	f->bytes_in_buf = 0;
 }
 
+#define STR_(n) #n
+#define STR(n) STR_(n)
 
 static
 const char *opts = ":hknsp:P";
@@ -94,7 +103,7 @@ int main(int argc, char **argv)
 {
 	const char *prgmname = argc?argv[0]:PRGMNAME_DEFAULT;
 	int opt, err = 0;
-	const char *name = NULL;
+	char *name = NULL;
 
 	bool use_kmsg = false, use_netconsole = false, use_syslog = false;
 	bool auto_name = false;
@@ -166,6 +175,19 @@ int main(int argc, char **argv)
 			name = argv[0];
 	}
 
+	size_t name_len = 0;
+	if (name)
+		name_len = strlen(name);
+
+	/* Generate a buffer for emitting the line prefixes */
+	char prefix_buf[3 /* "<N>" */ + name_len + 2 /* ": " */];
+	prefix_buf[0] = '<';
+	prefix_buf[1] = 'N';
+	prefix_buf[2] = '>';
+	memcpy(prefix_buf + 3, name, name_len);
+	prefix_buf[3 + name_len + 0] = ':';
+	prefix_buf[3 + name_len + 1] = ' ';
+
 	/* NOTE: error checking throughout this is a very fiddly problem:
 	 * because of the type of program this is, unless we're able to log
 	 * messages over the medium we're trying to open, the output may never
@@ -217,6 +239,25 @@ int main(int argc, char **argv)
 
 	close(new_stdout[1]);
 
+	/* if we've gotten here, we need to open our output mechanism so we can write into it later */
+	int output_fd = -1;
+	if (use_kmsg) {
+		output_fd = open("/dev/kmsg", O_WRONLY);
+		if (output_fd == -1) {
+			fprintf(stderr, "could not open /dev/kmsg: %s\n", strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+	} else if (use_netconsole) {
+		/* XXX: do this properly? */
+		output_fd = socket(AF_INET, SOCK_DGRAM, 0);
+		if (output_fd == -1) {
+			fprintf(stderr, "could not setup UDP socket for netconsole: %s\n", strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+	} else {
+		/* XXX: whoops? */
+	}
+
 	struct fbuf buf;
 
 	/* NOTE: we also need to wait() for the child to die and exit (or
@@ -229,15 +270,63 @@ int main(int argc, char **argv)
 
 	/* TODO: if required, process data over pipes */
 	for (;;) {
-		ssize_t r = read(new_stdout[0], fbuf_space_ptr(&buf), fbuf_space(&buf));
+		uint8_t *space = fbuf_space_ptr(&buf);
+		ssize_t r = read(new_stdout[0], space, fbuf_space(&buf));
 		if (r == 0) {
 			/* Bad things
 			 */
+			fprintf(stderr, "read returned 0\n");
+			/* XXX: flush data from buffer */
+			/* XXX: reap child & return it's return? */
+			exit(EXIT_FAILURE);
+		} else if (r < 0) {
+			/* XXX: flush data from buffer */
+			fprintf(stderr, "read returned %zd: %s\n", r, strerror(errno));
+			exit(EXIT_FAILURE);
 		}
 
-		/* TODO: read data */
+		fbuf_feed(&buf, r);
+
+		/* scan for newline in new data */
+		size_t i;
+		for (i = 0; i < (size_t)r; i++) {
+			if (space[i] == '\n') {
+				/* emit data up to this point */
+			}
+		}
+
+		if (fbuf_space(&buf)) {
+			/* while we have space, don't force a flush */
+			continue;
+		}
+
+		/* emit data! */
+		char *read_line = fbuf_data_ptr(&buf);
+		size_t read_line_len = fbuf_data(&buf);
+		struct iovec o[2] = {
+			{ prefix_buf, sizeof(prefix_buf) },
+			{ read_line, read_line_len }
+		};
+		struct iovec *v = o + 1;
+
+		if (name) {
+			v--;
+			/* extract line log level, if present */
+			if (read_line_len >= 3 && read_line[0] == '<' && read_line[2] == '>') {
+				prefix_buf[1] = read_line[1];
+				o[1].iov_base += 3;
+				o[1].iov_len -= 3;
+			} else {
+				/* no level, use default? */
+				prefix_buf[1] = LOG_INFO + '0';
+			}
+		}
 
 		/* TODO: write data to syslog or netconsole */
+#if 0
+		if (use_kmsg) {
+			writev(
+#endif
 	}
 
 	return 0;
