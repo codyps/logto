@@ -275,12 +275,14 @@ int main(int argc, char **argv)
 		if (r == 0) {
 			/* Bad things
 			 */
+			/* XXX: emit info to output stream */
 			fprintf(stderr, "read returned 0\n");
 			/* XXX: flush data from buffer */
 			/* XXX: reap child & return it's return? */
 			exit(EXIT_FAILURE);
 		} else if (r < 0) {
 			/* XXX: flush data from buffer */
+			/* XXX: emit info to output stream */
 			fprintf(stderr, "read returned %zd: %s\n", r, strerror(errno));
 			exit(EXIT_FAILURE);
 		}
@@ -308,25 +310,64 @@ int main(int argc, char **argv)
 			{ read_line, read_line_len }
 		};
 		struct iovec *v = o + 1;
+		size_t v_ct = 1;
+
+		bool have_level = read_line_len >= 3 && read_line[0] == '<' && read_line[2] == '>';
 
 		if (name) {
 			v--;
+			v_ct++;
 			/* extract line log level, if present */
-			if (read_line_len >= 3 && read_line[0] == '<' && read_line[2] == '>') {
+			if (have_level) {
 				prefix_buf[1] = read_line[1];
 				o[1].iov_base += 3;
 				o[1].iov_len -= 3;
 			} else {
 				/* no level, use default? */
 				prefix_buf[1] = LOG_INFO + '0';
+				have_level = true;
 			}
 		}
 
-		/* TODO: write data to syslog or netconsole */
-#if 0
-		if (use_kmsg) {
-			writev(
-#endif
+		/* write data to syslog or netconsole */
+		if (output_fd != -1) {
+			/* TODO: consider using splice for fd type interconnects where possible */
+			r = writev(output_fd, v, v_ct);
+			if (r < 0) {
+				fprintf(stderr, "emit failed: %s\n", strerror(errno));
+				exit(EXIT_FAILURE);
+			}
+
+			/* FIXME: support better advanced netconsole formats */
+		} else {
+			/* non-fd things */
+			if (use_syslog) {
+				/* TODO: compose data into a single buffer */
+				/* TODO: use syslog(3p) to emit */
+				int prio = LOG_INFO;
+				if (have_level) {
+					prio  = *((char *)(v[0].iov_base)) - '0';
+					v[0].iov_len -= 3;
+					v[0].iov_base += 3;
+				}
+
+				char unified_buf[v[0].iov_len + (v_ct > 1) * v[1].iov_len + 1];
+				char *pos = unified_buf;
+				for (i = 0; i < v_ct; i++) {
+					memcpy(pos, v[i].iov_base, v[i].iov_len);
+					pos += v[i].iov_len;
+				}
+
+				*pos = '\0';
+
+				/* XXX: consider using "%s%s" to eliminate copying */
+				syslog(prio, "%s", unified_buf);
+			} else {
+				/* XXX: complain */
+				fprintf(stderr, "whoops, the programmer screwed up\n");
+				exit(EXIT_FAILURE);
+			}
+		}
 	}
 
 	return 0;
