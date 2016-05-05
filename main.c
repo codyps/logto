@@ -41,7 +41,7 @@ static size_t fbuf_space(struct fbuf *f)
 
 static void fbuf_feed(struct fbuf *f, size_t n)
 {
-	assert(fbuf_space(f) <= n);
+	assert(fbuf_space(f) > n);
 	f->bytes_in_buf += n;
 }
 
@@ -98,6 +98,84 @@ void usage_(const char *prgmname, int e)
 	exit(e);
 }
 #define usage(e) usage_(prgmname, e)
+
+struct emit_ctx {
+	const char *name;
+	char *prefix_buf;
+	size_t prefix_buf_len;
+	int output_fd;
+	bool use_syslog;
+};
+
+static
+void emit_line(struct emit_ctx *e, char *read_line, size_t read_line_len)
+{
+	/* emit data! */
+	struct iovec o[2] = {
+		{ e->prefix_buf, e->prefix_buf_len },
+		{ read_line, read_line_len }
+	};
+	struct iovec *v = o + 1;
+	size_t v_ct = 1;
+
+	bool have_level = read_line_len >= 3 && read_line[0] == '<' && read_line[2] == '>';
+
+	if (e->name) {
+		v--;
+		v_ct++;
+		/* extract line log level, if present */
+		if (have_level) {
+			e->prefix_buf[1] = read_line[1];
+			o[1].iov_base += 3;
+			o[1].iov_len -= 3;
+		} else {
+			/* no level, use default? */
+			e->prefix_buf[1] = LOG_INFO + '0';
+			have_level = true;
+		}
+	}
+
+	/* write data to syslog or netconsole */
+	if (e->output_fd != -1) {
+		/* TODO: consider using splice for fd type interconnects where possible */
+		ssize_t r = writev(e->output_fd, v, v_ct);
+		if (r < 0) {
+			fprintf(stderr, "emit failed: %s\n", strerror(errno));
+			exit(EXIT_FAILURE);
+		}
+
+		/* FIXME: support better advanced netconsole formats */
+	} else {
+		/* non-fd things */
+		if (e->use_syslog) {
+			/* TODO: compose data into a single buffer */
+			/* TODO: use syslog(3p) to emit */
+			int prio = LOG_INFO;
+			if (have_level) {
+				prio  = *((char *)(v[0].iov_base)) - '0';
+				v[0].iov_len -= 3;
+				v[0].iov_base += 3;
+			}
+
+			char unified_buf[v[0].iov_len + (v_ct > 1) * v[1].iov_len + 1];
+			char *pos = unified_buf;
+			size_t i;
+			for (i = 0; i < v_ct; i++) {
+				memcpy(pos, v[i].iov_base, v[i].iov_len);
+				pos += v[i].iov_len;
+			}
+
+			*pos = '\0';
+
+			/* XXX: consider using "%s%s" to eliminate copying */
+			syslog(prio, "%s", unified_buf);
+		} else {
+			/* XXX: complain */
+			fprintf(stderr, "whoops, the programmer screwed up\n");
+			exit(EXIT_FAILURE);
+		}
+	}
+}
 
 int main(int argc, char **argv)
 {
@@ -268,6 +346,14 @@ int main(int argc, char **argv)
 	/* XXX: consider allowing the printing of informational messages when
 	 * the child is started and when it stops */
 
+	struct emit_ctx e = {
+		.name = name,
+		.output_fd = output_fd,
+		.prefix_buf = prefix_buf,
+		.prefix_buf_len = sizeof(prefix_buf),
+		.use_syslog = use_syslog,
+	};
+
 	/* TODO: if required, process data over pipes */
 	for (;;) {
 		uint8_t *space = fbuf_space_ptr(&buf);
@@ -277,6 +363,7 @@ int main(int argc, char **argv)
 			 */
 			/* XXX: emit info to output stream */
 			fprintf(stderr, "read returned 0\n");
+			emit_line(&e, fbuf_data_ptr(&buf), fbuf_data(&buf));
 			/* XXX: flush data from buffer */
 			/* XXX: reap child & return it's return? */
 			exit(EXIT_FAILURE);
@@ -293,7 +380,10 @@ int main(int argc, char **argv)
 		size_t i;
 		for (i = 0; i < (size_t)r; i++) {
 			if (space[i] == '\n') {
-				/* emit data up to this point */
+				/* TODO: emit data up to this point */
+				size_t l = fbuf_data(&buf);
+				emit_line(&e, fbuf_data_ptr(&buf), l);
+				fbuf_eat(&buf, l);
 			}
 		}
 
@@ -302,72 +392,10 @@ int main(int argc, char **argv)
 			continue;
 		}
 
-		/* emit data! */
 		char *read_line = fbuf_data_ptr(&buf);
 		size_t read_line_len = fbuf_data(&buf);
-		struct iovec o[2] = {
-			{ prefix_buf, sizeof(prefix_buf) },
-			{ read_line, read_line_len }
-		};
-		struct iovec *v = o + 1;
-		size_t v_ct = 1;
-
-		bool have_level = read_line_len >= 3 && read_line[0] == '<' && read_line[2] == '>';
-
-		if (name) {
-			v--;
-			v_ct++;
-			/* extract line log level, if present */
-			if (have_level) {
-				prefix_buf[1] = read_line[1];
-				o[1].iov_base += 3;
-				o[1].iov_len -= 3;
-			} else {
-				/* no level, use default? */
-				prefix_buf[1] = LOG_INFO + '0';
-				have_level = true;
-			}
-		}
-
-		/* write data to syslog or netconsole */
-		if (output_fd != -1) {
-			/* TODO: consider using splice for fd type interconnects where possible */
-			r = writev(output_fd, v, v_ct);
-			if (r < 0) {
-				fprintf(stderr, "emit failed: %s\n", strerror(errno));
-				exit(EXIT_FAILURE);
-			}
-
-			/* FIXME: support better advanced netconsole formats */
-		} else {
-			/* non-fd things */
-			if (use_syslog) {
-				/* TODO: compose data into a single buffer */
-				/* TODO: use syslog(3p) to emit */
-				int prio = LOG_INFO;
-				if (have_level) {
-					prio  = *((char *)(v[0].iov_base)) - '0';
-					v[0].iov_len -= 3;
-					v[0].iov_base += 3;
-				}
-
-				char unified_buf[v[0].iov_len + (v_ct > 1) * v[1].iov_len + 1];
-				char *pos = unified_buf;
-				for (i = 0; i < v_ct; i++) {
-					memcpy(pos, v[i].iov_base, v[i].iov_len);
-					pos += v[i].iov_len;
-				}
-
-				*pos = '\0';
-
-				/* XXX: consider using "%s%s" to eliminate copying */
-				syslog(prio, "%s", unified_buf);
-			} else {
-				/* XXX: complain */
-				fprintf(stderr, "whoops, the programmer screwed up\n");
-				exit(EXIT_FAILURE);
-			}
-		}
+		emit_line(&e, read_line, read_line_len);
+		fbuf_eat(&buf, read_line_len);
 	}
 
 	return 0;
