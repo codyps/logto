@@ -24,6 +24,9 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 
+/* waitpid() */
+#include <sys/wait.h>
+
 struct fbuf {
 	size_t bytes_in_buf;
 	uint8_t buf[4096];
@@ -72,7 +75,7 @@ static void fbuf_init(struct fbuf *f)
 #define STR(n) STR_(n)
 
 static
-const char *opts = ":hknsp:P";
+const char *opts = ":aehknsp:P";
 #define PRGMNAME_DEFAULT "logto"
 
 static
@@ -91,6 +94,9 @@ void usage_(const char *prgmname, int e)
 " -k          send output to /dev/kmsg\n"
 " -n          send output to netconsole (udp)\n"
 " -s          send output to syslog (local)\n"
+" -a          automatically select either stdout or kmsg based on\n"
+"             avaliability of STDIO_FILENO\n"
+" -e	      print exit status (only occurs if something else requires a fork)\n"
 " -p <name>   include name in the redirected output\n"
 " -P          as if `-p` was used with the last element of <program>\n"
 " -h          show this help text\n",
@@ -177,19 +183,37 @@ void emit_line(struct emit_ctx *e, char *read_line, size_t read_line_len)
 	}
 }
 
+static bool fd_is_open(int fd)
+{
+	off_t r = lseek(fd, 0, SEEK_CUR);
+	return r != -1 || errno != EBADF;
+}
+
 int main(int argc, char **argv)
 {
 	const char *prgmname = argc?argv[0]:PRGMNAME_DEFAULT;
 	int opt, err = 0;
 	char *name = NULL;
 
-	bool use_kmsg = false, use_netconsole = false, use_syslog = false;
+	bool use_kmsg = false, use_netconsole = false, use_syslog = false,
+	     use_stdout = false;
 	bool auto_name = false;
+	bool show_exit_status = false;
 
 	while ((opt = getopt(argc, argv, opts)) != -1) {
 		switch (opt) {
 		case 'h':
 			usage(EXIT_SUCCESS);
+			break;
+		case 'a':
+			if (fd_is_open(STDOUT_FILENO)) {
+				use_stdout = true;
+			} else {
+				use_kmsg = true;
+			}
+			break;
+		case 'e':
+			show_exit_status = true;
 			break;
 		case 'k':
 			use_kmsg = true;
@@ -217,12 +241,12 @@ int main(int argc, char **argv)
 		}
 	}
 
-	if (!use_netconsole && !use_kmsg && !use_syslog) {
+	if (!use_netconsole && !use_kmsg && !use_syslog && !use_stdout) {
 		fprintf(stderr, "Error: no destination selected, but one is required\n");
 		err++;
 	}
 
-	if ((use_netconsole + use_kmsg + use_syslog) > 1) {
+	if ((use_netconsole + use_kmsg + use_syslog + use_stdout) > 1) {
 		fprintf(stderr, "Sorry, right now we only support one destination at a time\n");
 		err++;
 	}
@@ -262,7 +286,8 @@ int main(int argc, char **argv)
 	prefix_buf[0] = '<';
 	prefix_buf[1] = 'N';
 	prefix_buf[2] = '>';
-	memcpy(prefix_buf + 3, name, name_len);
+	if (name)
+		memcpy(prefix_buf + 3, name, name_len);
 	prefix_buf[3 + name_len + 0] = ':';
 	prefix_buf[3 + name_len + 1] = ' ';
 
@@ -280,7 +305,7 @@ int main(int argc, char **argv)
 			fprintf(stderr, "could not open /dev/kmsg: %s\n", strerror(errno));
 			exit(EXIT_FAILURE);
 		}
-	} else {
+	} else if (!(use_stdout && !name)) {
 		int r = pipe(new_stdout);
 		if (r == -1) {
 			fprintf(stderr, "could not setup pipe(): %s\n", strerror(errno));
@@ -292,7 +317,7 @@ int main(int argc, char **argv)
 	/* if required, fork */
 	bool should_exec = true;
 	pid_t child = -1;
-	if (new_stdout[0] != -1) {
+	if (new_stdout[0] != -1 && !(use_stdout && !name)) {
 		child = fork();
 		if (child == -1) {
 			fprintf(stderr, "fork failed: %s\n", strerror(errno));
@@ -302,11 +327,13 @@ int main(int argc, char **argv)
 
 	if (should_exec) {
 		/* dup new fds into place, close old ones */
-		dup2(new_stdout[1], STDOUT_FILENO);
-		dup2(new_stdout[1], STDERR_FILENO);
+		if (!(use_stdout && !name)) {
+			dup2(new_stdout[1], STDOUT_FILENO);
+			dup2(new_stdout[1], STDERR_FILENO);
 
-		close(new_stdout[0]);
-		close(new_stdout[1]);
+			close(new_stdout[0]);
+			close(new_stdout[1]);
+		}
 
 		int r = execvp(argv[0], argv);
 		if (r == -1) {
@@ -332,11 +359,14 @@ int main(int argc, char **argv)
 			fprintf(stderr, "could not setup UDP socket for netconsole: %s\n", strerror(errno));
 			exit(EXIT_FAILURE);
 		}
+	} else if (use_stdout) {
+		output_fd = STDOUT_FILENO;
 	} else {
 		/* XXX: whoops? */
 	}
 
 	struct fbuf buf;
+	fbuf_init(&buf);
 
 	/* NOTE: we also need to wait() for the child to die and exit (or
 	 * preform another appropriate action) when it does.
@@ -359,14 +389,37 @@ int main(int argc, char **argv)
 		uint8_t *space = fbuf_space_ptr(&buf);
 		ssize_t r = read(new_stdout[0], space, fbuf_space(&buf));
 		if (r == 0) {
-			/* Bad things
-			 */
-			/* XXX: emit info to output stream */
-			fprintf(stderr, "read returned 0\n");
-			emit_line(&e, fbuf_data_ptr(&buf), fbuf_data(&buf));
-			/* XXX: flush data from buffer */
-			/* XXX: reap child & return it's return? */
-			exit(EXIT_FAILURE);
+			/* This indicates the other end of the pipe() closed.
+			 * Either the program has exited, or for some reason it
+			 * closed the fd. For now, assume this means a program
+			 * exit. */
+
+			/* flush data from buffer */
+			if (fbuf_data(&buf)) {
+				emit_line(&e, fbuf_data_ptr(&buf), fbuf_data(&buf));
+			}
+
+			/* reap child & return it's return */
+			/* TODO: handle the case where the child hasn't died,
+			 * but it has closed it's output. Also allow some
+			 * timeout for it to die after closing it's output */
+			int status = 0;
+			int rw = waitpid(-1, &status, 0);
+			if (rw < 0) {
+				fprintf(stderr, "waitpid returned %d: %s\n", rw, strerror(errno));
+				exit(EXIT_FAILURE);
+			}
+
+			if (show_exit_status) {
+				/* FIXME: provide a printf for emit_ctx */
+				/* TODO: use more of the exit status */
+				char out[1024];
+				snprintf(out, sizeof(out) - 1, "[logto: program %s exited with code %d]\n", name?name:argv[0], WEXITSTATUS(status));
+				out[sizeof(out) - 1] = '\0';
+				emit_line(&e, out, strlen(out));
+			}
+
+			exit(WEXITSTATUS(status));
 		} else if (r < 0) {
 			/* XXX: flush data from buffer */
 			/* XXX: emit info to output stream */
