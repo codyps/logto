@@ -247,17 +247,14 @@ int main(int argc, char **argv)
 	}
 
 	if ((use_netconsole + use_kmsg + use_syslog + use_stdout) > 1) {
-		fprintf(stderr, "Sorry, right now we only support one destination at a time\n");
+		fprintf(stderr, "Error: Sorry, right now we only support one destination at a time\n");
 		err++;
 	}
 
 	if (name && auto_name) {
-		fprintf(stderr, "Use either -p or -P, not both\n");
+		fprintf(stderr, "Error: Use either -p or -P, not both\n");
 		err++;
 	}
-
-	if (err)
-		usage(EXIT_FAILURE);
 
 
 	/* TODO: check that we don't have any extra file descriptors open */
@@ -268,6 +265,14 @@ int main(int argc, char **argv)
 	 */
 	argc -= optind;
 	argv += optind;
+
+	if (!argv[0]) {
+		fprintf(stderr, "Error: a program to execute is required\n");
+		err++;
+	}
+
+	if (err)
+		usage(EXIT_FAILURE);
 
 	if (auto_name) {
 		/* direct assignment (instead of strdup) is fine because we're
