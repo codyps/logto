@@ -1,4 +1,4 @@
-= logto =
+# `logto`
 
 Redirect program output to logging locations.
 
@@ -14,7 +14,7 @@ Supports:
  - prefixing output with a 'name: ' (and auto-selecting that name based on exe name)
  - chooses to fork or just fixes up fds based on request
 
-== Todo ==
+## Todo 
 
  - Rotated file
  - logto as a library
@@ -22,14 +22,14 @@ Supports:
  - stderr
 
 
-=== Way out there ===
+### Way out there 
 
  - support start-stop-daemon like functionality (ie: remove the need to use
    start-stop-daemon if using logto).
  - support "started" notification via sd_notify() api for start-stop-daemon
    users.
 
-== License ==
+## License 
 
 GPLv3 or later.
 
